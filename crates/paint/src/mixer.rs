@@ -11,6 +11,7 @@ use photocraft_raster::{Surface, from_rgba, from_rgba_into, to_rgba};
 use serde::{Deserialize, Serialize};
 
 use crate::Stroke;
+pub use crate::pigment::WetColorSpace;
 use crate::retouch::{Footprint, Region, alpha_index, apply_dab_stroke, over_native};
 use photocraft_geom::Rect;
 
@@ -178,9 +179,7 @@ fn apply_wet_blending_stroke(
 ) -> Rect {
     let fmt = target.format();
     let mut wet = WetBlending::new(fmt, settings);
-    let mut st = stroke.clone();
-    st.brush.opacity = 1.0;
-    apply_dab_stroke(target, &st, selection, lock_transparency, 0, |work, fp| wet.dab(work, fp, sample, lock_transparency))
+    wet.apply_stroke(target, sample, stroke, selection, lock_transparency)
 }
 
 /// Stroke-local Wet Blending color state. `dab` is public so live previews and the committed
@@ -200,6 +199,7 @@ pub struct WetBlending {
     next: Vec<f32>,
     paint: Vec<f32>,
     converted_sample: Vec<f32>,
+    color_space: Option<WetColorSpace>,
 }
 
 impl WetBlending {
@@ -219,11 +219,32 @@ impl WetBlending {
             next: vec![0.0; nc + 1],
             paint: vec![0.0; fmt.channels()],
             converted_sample: vec![0.0; fmt.channels()],
+            color_space: None,
         }
+    }
+
+    /// Install document/composite ICC transforms. Scalar mask/channel targets retain their
+    /// native gray interpretation when their channel count differs from the document profile.
+    pub fn with_color_space(mut self, space: WetColorSpace) -> Self {
+        if space.matches(self.fmt) {
+            self.color_space = Some(space);
+        }
+        self
+    }
+
+    pub fn apply_stroke(&mut self, target: &mut Surface, sample: Option<&Surface>, stroke: &Stroke, selection: Option<&Surface>, lock: bool) -> Rect {
+        let mut st = stroke.clone();
+        st.brush.opacity = 1.0;
+        apply_dab_stroke(target, &st, selection, lock, 0, |work, fp| self.dab(work, fp, sample, lock))
     }
 
     pub fn dab(&mut self, work: &mut Region, fp: &Footprint, sample: Option<&Surface>, lock_transparency: bool) {
         let mut source_native = from_rgba(&self.fmt, fp.dab.color);
+        if !matches!(self.fmt.mode, photocraft_color::ColorMode::Rgb | photocraft_color::ColorMode::Indexed | photocraft_color::ColorMode::Multichannel)
+            && let Some(space) = &self.color_space
+        {
+            space.convert_brush(&fp.dab.color, &mut source_native);
+        }
         if let Some(a) = self.alpha
             && let Some(ch) = source_native.get_mut(a)
         {
@@ -246,7 +267,13 @@ impl WetBlending {
                 let px: &[f32] = if let (Some(s), Some(data)) = (sample, sample_data.as_ref()) {
                     let i = ((y - r.y0) as usize * r.width() as usize + (x - r.x0) as usize) * sample_channels;
                     let Some(channels) = data.get(i..i + sample_channels) else { continue };
-                    if s.format() == self.fmt {
+                    if let Some(space) = &self.color_space {
+                        space.convert_sample(channels, &mut self.converted_sample);
+                        if let Some(dst) = self.alpha.and_then(|i| self.converted_sample.get_mut(i)) {
+                            *dst = alpha_index(&s.format()).and_then(|i| channels.get(i)).copied().unwrap_or(1.0);
+                        }
+                        &self.converted_sample
+                    } else if s.format() == self.fmt {
                         channels
                     } else {
                         let rgba = to_rgba(&s.format(), channels);
@@ -282,18 +309,21 @@ impl WetBlending {
         let blend = self.blend0 * fp.dab.mix.clamp(0.0, 1.0);
         let mixed_alpha = sample_alpha + (1.0 - sample_alpha) * self.dilution;
         let source_alpha = self.alpha.and_then(|i| source_native.get(i).copied()).unwrap_or(1.0).clamp(0.0, 1.0) * fp.dab.opacity.clamp(0.0, 1.0);
-        self.next.fill(0.0);
-        for (c, dst) in self.next.iter_mut().take(self.nc).enumerate() {
+        let mut diluted_storage = [0.0; 5];
+        let mut source_storage = [0.0; 5];
+        let diluted = &mut diluted_storage[..self.nc + 1];
+        let source = &mut source_storage[..self.nc + 1];
+        for (c, dst) in diluted.iter_mut().take(self.nc).enumerate() {
             let sampled_premul = self.sampled[c] / weight_sum;
-            let diluted = sampled_premul + (self.straight_sample[c] - sampled_premul) * self.dilution;
-            let source_premul = mixed_alpha * source_alpha * source_native.get(c).copied().unwrap_or(0.0);
-            *dst = diluted + (source_premul - diluted) * blend;
+            *dst = sampled_premul + (self.straight_sample[c] - sampled_premul) * self.dilution;
+            source[c] = mixed_alpha * source_alpha * source_native.get(c).copied().unwrap_or(0.0);
         }
-        self.next[self.nc] = mixed_alpha + (mixed_alpha * source_alpha - mixed_alpha) * blend;
+        diluted[self.nc] = mixed_alpha;
+        source[self.nc] = mixed_alpha * source_alpha;
+        crate::pigment::mix_native(self.fmt, self.color_space.as_ref(), diluted, source, blend, &mut self.next);
         if let Some(previous) = self.carried.as_ref() {
-            for (dst, prev) in self.next.iter_mut().zip(previous) {
-                *dst = *prev + (*dst - *prev) * self.persistence;
-            }
+            crate::pigment::mix_native(self.fmt, self.color_space.as_ref(), previous, &self.next, self.persistence, diluted);
+            self.next.copy_from_slice(diluted);
             if let Some(state) = self.carried.as_mut() {
                 state.copy_from_slice(&self.next);
             }
@@ -492,5 +522,46 @@ mod tests {
         let retain_first = run(1.0);
         assert!(reset_each_dab[..3].iter().all(|v| *v > 0.9), "no persistence follows the white sample: {reset_each_dab:?}");
         assert!(retain_first[2] > 0.9 && retain_first[0] < 0.1, "full persistence retains the first blue mixture: {retain_first:?}");
+    }
+
+    #[test]
+    fn wet_mixes_blue_and_yellow_into_green_while_default_still_averages() {
+        for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+            for wet_blending in [false, true] {
+                let mut target = Surface::new(fmt);
+                target.fill_rect(Rect::new(0, 0, 200, 20), &[1.0, 1.0, 0.0, 1.0]);
+                let mut k = stroke(10.0);
+                k.brush.color = [0.0, 0.0, 1.0, 1.0];
+                k.points.truncate(1);
+                let settings = MixerSettings { wet_blending, blending: 0.5, wet: 1.0, mix: 0.5, load: 1.0, ..Default::default() };
+                let mut state = MixerState::default();
+                state.load(k.brush.color);
+                apply_mixer_stroke(&mut target, None, &k, &settings, &mut state, None, false);
+                let [r, g, b, a] = target.rgba(4, 10);
+                assert!((a - 1.0).abs() < 0.005);
+                if wet_blending {
+                    assert!(g > r + 0.05 && g > b, "{fmt:?}: {r} {g} {b}");
+                } else {
+                    for v in [r, g, b] {
+                        assert!((v - 0.5).abs() < 0.005, "{fmt:?}: {r} {g} {b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wet_persistence_mixes_carried_paint_subtractively() {
+        let mut sample = Surface::new(PixelFormat::RGBA32F);
+        let mut target = Surface::new(PixelFormat::RGBA32F);
+        let mut wet = WetBlending::new(target.format(), &MixerSettings { wet_blending: true, blending: 1.0, persistence: 0.5, ..Default::default() });
+        let mut k = stroke(10.0);
+        k.points.truncate(1);
+        sample.fill_rect(Rect::new(0, 0, 200, 20), &[0.0, 0.0, 1.0, 1.0]);
+        wet.apply_stroke(&mut target, Some(&sample), &k, None, false);
+        sample.fill_rect(Rect::new(0, 0, 200, 20), &[1.0, 1.0, 0.0, 1.0]);
+        wet.apply_stroke(&mut target, Some(&sample), &k, None, false);
+        let [r, g, b, _] = target.rgba(4, 10);
+        assert!(g > r + 0.05 && g > b, "{r} {g} {b}");
     }
 }

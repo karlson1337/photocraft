@@ -23,6 +23,7 @@ pub mod brush;
 pub mod dynamics;
 pub mod mixer;
 pub mod outline;
+mod pigment;
 pub mod presets;
 pub mod procedural;
 pub mod render;

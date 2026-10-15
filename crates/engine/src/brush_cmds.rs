@@ -647,6 +647,13 @@ fn mixer_settings(brush: &BrushSettings, p: &Value) -> MixerSettings {
     }
 }
 
+fn wet_color_space(doc: &photocraft_doc::Document, p: &Value) -> Result<photocraft_paint::mixer::WetColorSpace> {
+    let profile = crate::color_cmds::document_profile(doc);
+    let target = if is_mask_target(p) || crate::channel_cmds::is_channel_target(p) { photocraft_cms::Builtin::SGray.profile() } else { &profile };
+    photocraft_paint::mixer::WetColorSpace::new(target, &crate::color_cmds::composite_profile(doc))
+        .map_err(|e| bad("paint.mixerBrush", format!("wet mixing color transform: {e}")))
+}
+
 fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "paint.mixerBrush";
     let pts = parse_points(p, cmd)?;
@@ -661,6 +668,7 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
     let id = if crate::channel_cmds::is_channel_target(p) { None } else { Some(layer_id(s, p)?) };
     let stroke = Stroke { brush, points: pts };
     let dmg = s.edit("Mixer Brush", |doc, _| {
+        let wet_space = if m.wet_blending { Some(wet_color_space(doc, p)?) } else { None };
         let sel = doc.selection.clone();
         let sample = if sample_all {
             let ds = photocraft_paint::dabs(&stroke);
@@ -677,6 +685,10 @@ fn mixer_brush(s: &mut Session, p: &Value) -> Result<Value> {
             None
         };
         let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
+        if let Some(space) = wet_space {
+            let mut wet = photocraft_paint::mixer::WetBlending::new(surf.format(), &m).with_color_space(space);
+            return Ok(wet.apply_stroke(surf, sample.as_ref(), &stroke, sel.as_ref(), lock));
+        }
         Ok(apply_mixer_stroke(surf, sample.as_ref(), &stroke, &m, &mut state, sel.as_ref(), lock))
     })?;
     if !m.wet_blending && clean {
@@ -698,6 +710,7 @@ pub fn live_mixer_blending(s: &Session, p: &Value) -> Result<crate::retouch_cmds
     if !settings.wet_blending {
         return Err(bad(cmd, "live preview requires Wet Blending"));
     }
+    let wet_space = s.active().map(|st| wet_color_space(&st.doc, p)).transpose()?;
     let sample_doc = settings.sample_all_layers.then(|| s.active().map(|st| std::sync::Arc::clone(&st.doc))).flatten();
     let id = if crate::channel_cmds::is_channel_target(p) { None } else { Some(layer_id(s, p)?) };
     let mut stroke = Stroke { brush, points };
@@ -713,6 +726,9 @@ pub fn live_mixer_blending(s: &Session, p: &Value) -> Result<crate::retouch_cmds
         crate::retouch_cmds::LiveDabOptions { halo: 0, float_work: true },
         |pre, lock| {
             let mut wet = photocraft_paint::mixer::WetBlending::new(pre.format(), &settings);
+            if let Some(space) = wet_space {
+                wet = wet.with_color_space(space);
+            }
             let mut sample = photocraft_raster::Surface::new(photocraft_color::PixelFormat::RGBA32F);
             crate::retouch_cmds::LiveDabEffect::Forkable(Box::new(
                 move |work: &mut photocraft_paint::retouch::Region, fp: &photocraft_paint::retouch::Footprint| {

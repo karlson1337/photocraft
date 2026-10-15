@@ -4904,6 +4904,7 @@ dependencies = [
 name = "photocraft-paint"
 version = "0.9.0"
 dependencies = [
+ "photocraft-cms",
  "photocraft-color",
  "photocraft-geom",
  "photocraft-raster",
